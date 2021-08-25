@@ -1,0 +1,419 @@
+---
+title: "Generalizable EHR Labs Abstraction (eLAB) Pipeline"
+author: "Sophia Z. Shalhout"
+date: "11/19/2020"
+output:
+  html_document:
+    toc: yes
+    toc_float: true
+  pdf_document:
+    toc: yes
+always_allow_html: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=80), tidy=TRUE)
+```
+
+### Load Libraries
+```{r Load libraries, warning=FALSE, message=FALSE}
+library(DescTools)
+library(assertthat)
+library(tidyverse)
+library(knitr)
+library(readxl)
+library(scales)
+library(reshape2)
+library(janitor)
+library(rstatix)
+library(ggpubr)
+library(PairedData)
+library(kableExtra)
+library(readr)
+library(data.table)
+library(kableExtra)
+library(stringi)
+library(splitstackshape)
+library(readxl)
+library(plyr)
+library(dplyr)
+library(stringr)
+```
+
+### Load Data 
+- THIS WORKING DOCUMENT DOES NOT CONTAIN PROTECTED HEALTH INFORMATION.
+- A Simulated EHR bulk data pull is used here.
+- A Simulated Patient REGISTRY KEY is used in this environment.
+- However, this is employed during the import of REAL/ TRUE Registry data into the REDCap-based National MCC Registry.
+- Any work using real patient data abstracted from an EHR must be approved by the respective institutional review board.
+- For import into the REDCap project, REDCap-participating institutions can load the accompanying provided data dictionary which codes for 3 instruments: 1) Subject Status, 2) Patient Characteristics, 3) Lab Results
+- A REDCap API Token and REDCapR can be used for direct import. Here, for demonstration purposes, the output is a REDCap-ready importable csv file since all API tokens are uniquely distributed and project specific.
+
+```{r Load Data, warning=FALSE, message=FALSE}
+# Load Data: Let us load the accompanying Sample Data Set created for demonstration purposes entitled "Simulated_Data_Set_EHR".
+dt <- read_excel("Simulated_Data_Set_EHR.xlsx")
+
+#Let's make sure the Results and Time are in 'date' and 'time' formats. We are keeping time because in many cases, the same lab was run on the same date per record/patient.
+
+dt$`Collection Time`<- as.POSIXct(dt$`Collection Time`, format = "%H:%M:%S")
+
+#There was no original date in the EHR report for time so let's remove the default date introduced
+
+dt <-cSplit(dt, "Collection Time", sep = " ", direction = "wide")
+
+dt$`Collection Date`<- as.POSIXct(dt$`Collection Date`, format = "%Y-%m-%d")
+#Or dt$Results<- as.Date(dt$'Collection Date', format = '%Y-%m-%d')
+```
+
+### Prepare a REDCap template 
+- This template will use the same variable codes in the Data Dictionary instead of those returned in the Sample EHR Data Set/Report.
+- For example, Sodium is termed Sodium not Na, so prepare a REDCap template that uses the term 'Sodium'
+- This is the simplest approach that will require only parsing and not remapping data element names or renaming them
+- However, in most cases, there will be a pre defined or existing/in use database that one may want to add elements into and it may only match for example, EHR Report outputs and NOT RPDR outputs, or labs under an old name and not a new updated version etc.
+
+- Therefore, remapping and renaming will likely not be avoidable when building a large repository or database over time  where the data arises from many sources.
+
+- There are other challenges that may be involved and we will discuss how to work around them. Many solutions and alternatives exist, and this is one path, not the only path. Users/readers are encouraged to explore what works best for their workflow.
+
+- For example, the first challenge is that the EHR report returns semi-structured but untidy data. One cell in excel contains many labs per patient.
+
+- Note the pattern here - the lab name is always separated by a colon and we will split on that.
+
+- If other inputs are used from other sources or institutions, adapt early parsing and splitting code based on observed patterns/delimiters. Is the data already 'tidy'? Is the data separated by spaces or commas instead of colons? The user is urged to adapt the early script here as needed. 
+
+- If the accompanying data dictionary is used, however, downstream code should largely be conserved.
+
+### Select Columns of interest
+```{r Select columns of interest if data pull has extra columns, message=FALSE, warning=FALSE}
+#There are several alternatives to perform these same or similar tasks in R. Readers are encouraged to adapt and improve script to their needs.
+
+#Let's select the columns of interest from the EHR data pull/sample data set, drop any row without a lab result, and rename column names for convenience
+
+dt <-  dt %>%  dplyr::select("Patient Name (MRN)", "Collection Date", "Collection Time_2", "Last Lab Results")%>% drop_na("Last Lab Results") %>%  dplyr::rename( Labs = "Last Lab Results" , Results = "Collection Date", Time = "Collection Time_2")
+
+```
+
+### Split on Delimiters
+```{r Split Labs on common delimiters/ features,message=FALSE, warning=FALSE}
+#We need to parse and split the labs per date and time per record
+
+#First let us separate each individual lab based on the fact that each one is listed on a new line in the cell. We will add a new row for each lab, or transform in 'long' direction.
+
+dt1<-cSplit(dt, "Labs", sep = "\n", direction = "long")
+
+#Now let's separate or split the type of lab from the actual lab value/result by the colon that separates them in the EHR report
+
+dt2<-cSplit(dt1, "Labs", sep = ":", direction = "wide")
+
+#We can easily now  separate the lab value from the lab unit since all we want to import into REDCap based on the data dictionary is the lab value. 
+
+#However, If you are using/creating an instrument where the lab unit is independently entered, you will keep the units as well for importing.
+
+dt3<-cSplit(dt2, "Labs_2", sep = " ", direction= "wide")
+
+```
+
+### Remap and Tidy Format
+```{r ReMap and Tidy Labs of interest for Registry according to Data Dictionary, message=FALSE, warning=FALSE}
+#Let's  select only the labs we are interested in importing before we continue to tidy the data further
+
+#We have created and provided a look up table that contains the Labs reported by EHR raw reports and the code name for the data element in the data dictionary for the labs instrument in REDCap that we are interested in capturing for real-world data analysis in our registry.
+
+#Users may expand/remove/adapt the key and the data dictionary as needed.
+#A lookup table was created using the code book and is provided. Let's load the look up table.
+
+look <- read_excel("labs_lookup.xlsx")
+
+
+#Let's make sure that our key and data are all lower case values so that legitimate labs and units are not excluded due to differences in uppercase/lowercase/exact matches
+look$ehr = tolower(look$ehr)
+look$ehr_units = tolower(look$ehr_units)
+dt3$Labs_1 = tolower(dt3$Labs_1)
+dt3$Labs_2_2 = tolower(dt3$Labs_2_2)
+
+dt4<- dt3[ which( dt3$Labs_1 %in% look$ehr ), "Labs_1"] # Here, we simply seeing how many individual labs we have
+dt5<- subset(dt3,dt3$Labs_1 %in% look$ehr ) 
+dt6<- subset(dt5,dt5$Labs_2_2 %in% look$ehr_units ) #let's subset these and keep all the variables
+dt7<-cSplit(dt6, "Labs_2_1", sep = "%", direction= "wide")
+
+#Plt and WBC are sometimes reported in units that are 10*3/uL which is equivalent to the unit we are capturing but since the unit here wasn't separated by a space, it was not removed earlier so we will remove it now. The same is true with RBC and 10*6/uL unit as well as 10^3/uL and 10^6/ul. Let's remove both of these units so that only the value remains. Furthermore, a handful of PTT were reported as >150. We only want to enter numerics into Redcap so we will remove the > than sign and leave just the value. 
+dt8<-cSplit(dt7, "Labs_2_1_1", sep = "10*3/uL", direction= "wide")
+dt9<-cSplit(dt8, "Labs_2_1_1_1", sep = "10*6/uL", direction= "wide")
+dt10<-cSplit(dt9, "Labs_2_1_1_1_1", sep = "10^3/uL", direction= "wide")
+dt11<-cSplit(dt10, "Labs_2_1_1_1_1_1", sep = "10^6/uL", direction= "wide")
+
+dt11$Values = str_replace_all(dt11$Labs_2_1_1_1_1_1_1, ">", "")
+dt11$Values = str_replace_all(dt11$Values, "<", "")
+dt11$Values = str_replace_all(dt11$Values, "=", "")
+dt11$Values = str_replace_all(dt11$Values, "0.00/100", "0.00")
+dt11$Values = str_replace_all(dt11$Values, "0.00...", "0.00")
+dt11$Values = str_replace_all(dt11$Values, "0.0.../100", "0.00")
+dt11$Values = str_replace_all(dt11$Values, "0.00...", "0.00")
+dt11$Values = str_replace_all(dt11$Values, "/100", " ")
+
+#Some lab "values" are words that describe patterns such as nucleolar or speckled. So we want to keep these but remove words associated with failed lab results such as "credited", "refused" and "n/a".
+dt12<- dt11[!(dt11$Values=="CREDITED"),]
+dt12<- dt12[!(dt12$Values=="Credit"),]
+dt12<- dt12[!(dt12$Values=="CREDIT"),]
+dt12<- dt12[!(dt12$Values=="UNSATISFACTORY,..."),] 
+dt12<- dt12[!(dt12$Values=="REFUSED"),]
+dt12<- dt12[!(dt12$Values=="Refused"),]
+dt12<- dt12[!(dt12$Values=="Refused/100"),]
+dt12<- dt12[!(dt12$Values=="Cancelled/100"),]
+dt12<- dt12[!(dt12$Values=="Cancelled"),]
+dt12<- dt12[!(dt12$Values=="TNP"),]
+dt12<- dt12[!(dt12$Values=="CANCELED"),]
+dt12<- dt12[!(dt12$Values=="Cancelled "),]
+dt12<- dt12[!(dt12$Values=="Refused "),]
+
+
+
+#Now we can select only those columns of interest since all that is left is the patient name, lab type, and lab value
+
+LABS_REDCap<- dt12 %>% dplyr::select("Patient Name (MRN)", Results, Time, Labs_1, Values)
+
+```
+
+### Deidentify Data
+```{r Deidentify Patients for Registry Import, message=FALSE, warning=FALSE}
+#We need to convert the Patient Names from the EHR bulk data pull/sample report to the pre-assigned Registry ID/REDCap record ID number. 
+
+#Remember converting the names to the record ID is straightforward using a look up key but some caution is needed.
+
+#Medical Record Numbers (MRNs) are not always the same, some patients have several MRNs, and DIFFERENT patients may have the exact same name in the registry that may or may not differ by a middle initial. 
+#So, always quality control/check your output!
+
+#Let's start by converting the patient name/MRN to their record ID used in the registry. We do not capture this PHI in our REDCap cohort and use a 'KEY' where record ids have been assigned to the patient/mrn. Please note that REDCap is HIPAA compliant and the names and mrns may be captured in REDCap. 
+
+#If your record id is the patient name, you dont need to convert to a different identifying number.
+
+#A Simulated 'RECORD ID' to 'Patient name' Key was created for demonstration purposes here.
+#Let's load the record id key
+key <- read_excel("Simulated_RECORD_ID_KEY.xlsx")
+#We have the option to create a lookup data frame with only the key and value
+key <-  key %>%  dplyr::select(RECORD_ID, Full_Name)
+
+#Let's make sure everything is in lowercase letters
+key$Full_Name = tolower(key$Full_Name)
+
+LABS_REDCap$`Patient Name (MRN)`=tolower(LABS_REDCap$`Patient Name (MRN)`)
+
+#Let's separate the MRN from the patient name in LABS_REDCap, we have the option of leaving it if we do not want to do an exact match but a partial match. However, some patients have the same name and it is only different by a middle letter initial,so we will separate the MRNS from that column 
+
+
+LABS_REDCap<-cSplit(LABS_REDCap, "Patient Name (MRN)", sep = "(", direction= "wide")
+
+#Let's remove the remanining open parenthetical
+LABS_REDCap<-cSplit(LABS_REDCap, "Patient Name (MRN)_2", sep = ")", direction= "wide")
+
+#Let's match and replace so that we will remove the simulated name/PHI from the data
+LABS_REDCap$Record_id <- data.frame(key$RECORD_ID [match(LABS_REDCap$`Patient Name (MRN)_1`, key$Full_Name)])
+
+
+```
+
+### Pivot Wider for REDCap
+```{r Pivot Wider and Transform Data to REDCap-ready format, message=FALSE, warning=FALSE}
+#Finally, we need to map the data into the format readily accepted by the REDCap import module as determined by the wide format for REDCap and the data dictionary.
+
+#We need to format both the labs and record ids into the correct format for importing into REDCap.
+
+#Each type of lab is also associated with a lab type (e.g. liver function, hematological, chemistries, renal, cardiac) to allow the survey to pop up so that the data abstractor is not presented with fields for labs that are not relevant to that patient and curation session to optimize UX/UI. The code for each REDCap lab type is matched to each actual lab in a table. Let's import the lab types (eg. hematological) and specific labs (eg. wbc, rbc).
+
+#Let's make sure all is in lowercase letters
+#We have the option to create a lookup data frame with only the key and value
+lookup <-  look %>%  dplyr::select(label_data_dictionary, ehr)
+lookup$ehr = tolower(lookup$ehr)
+#Let's create a new column with code for the lab performed
+LABS_REDCap$Labs <- data.frame(lookup$label_data_dictionary [match(LABS_REDCap$Labs_1, lookup$ehr)])
+
+
+
+#Let's now import the lab type/category for each kind of lab and add a column with the lab_type code
+
+#To import into REDCap lets pivot the data into the wide format that REDCap accepts
+
+#Let's select columns that are required for proper importing into redcap and rename them for mapping into REDCap for proper import
+LABS_REDCap <-  LABS_REDCap %>%  dplyr::select(Record_id, Results, Time,  Labs, Values)%>% dplyr::rename( lab_time = "Time" , record_id = "Record_id", lab_dtc = "Results") #REMOVED LAB TYPE HERE
+LABS_REDCap <-LABS_REDCap %>% pivot_wider (names_from = Labs, values_from = Values)
+LABS_REDCap = data.frame(lapply(LABS_REDCap, as.character), stringsAsFactors=FALSE)
+
+                                  
+                                  
+#Let's create a date time combined field to determine the lab capture instrument instance in REDCap
+LABS_REDCap$datetime <- as.POSIXct(paste(LABS_REDCap$lab_dtc, LABS_REDCap$lab_time), format="%Y-%m-%d %H:%M:%S")
+#Each imported row in REDCap needs to be identified by the instrument that the data will be imported into. Let's label each row with the instrument name, in this case lab_results
+LABS_REDCap$redcap_repeat_instrument <- paste("lab_results")
+
+#Let's ensure each column used for ranking is a factor
+
+LABS_REDCapRANK <- LABS_REDCap %>%  dplyr::arrange(record_id, lab_dtc,lab_time)%>%
+   dplyr::group_by(record_id) %>% dplyr::mutate(redcap_repeat_instance = dense_rank(datetime))
+LABS_REDCapRANK
+
+
+LABS_REDCapRANK = data.frame(lapply(LABS_REDCapRANK, as.character), stringsAsFactors=FALSE)
+
+
+#Now we need to add individual columns for the lab types since in REDCap these are coded as 0 for not having that lab type and 1 for having the lab type
+LABS_REDCapRANK$lab_type___1 <- ifelse(  LABS_REDCapRANK$na !="NULL"| LABS_REDCapRANK$k !="NULL"| LABS_REDCapRANK$cl !="NULL"| LABS_REDCapRANK$co2 !="NULL"| LABS_REDCapRANK$bun !="NULL"| LABS_REDCapRANK$cre !="NULL"| LABS_REDCapRANK$gfr !="NULL"| LABS_REDCapRANK$glu !="NULL"| LABS_REDCapRANK$anion !="NULL", 1, "")
+LABS_REDCapRANK$lab_type___2 <- ifelse(  LABS_REDCapRANK$alb !="NULL"| LABS_REDCapRANK$tbili !="NULL"| LABS_REDCapRANK$ca !="NULL"| LABS_REDCapRANK$tp !="NULL", 1, "")
+LABS_REDCapRANK$lab_type___3 <- ifelse( LABS_REDCapRANK$sgpt !="NULL"| LABS_REDCapRANK$sgot !="NULL"| LABS_REDCapRANK$alkp !="NULL"| LABS_REDCapRANK$glob !="NULL", 1, "")
+LABS_REDCapRANK$lab_type___4 <- ifelse(  LABS_REDCapRANK$wbc !="NULL"| LABS_REDCapRANK$rbc !="NULL"| LABS_REDCapRANK$hgb !="NULL"| LABS_REDCapRANK$hct !="NULL"| LABS_REDCapRANK$mcv !="NULL"| LABS_REDCapRANK$mch !="NULL"| LABS_REDCapRANK$mchc !="NULL"| LABS_REDCapRANK$plt !="NULL"| LABS_REDCapRANK$mpv !="NULL"| LABS_REDCapRANK$rdw !="NULL"| LABS_REDCapRANK$neut !="NULL"| LABS_REDCapRANK$lymp !="NULL"| LABS_REDCapRANK$mon !="NULL"| LABS_REDCapRANK$eosp !="NULL"| LABS_REDCapRANK$basop !="NULL"| LABS_REDCapRANK$immgranp !="NULL"| LABS_REDCapRANK$nrbc !="NULL", 1, "")
+LABS_REDCapRANK$lab_type___5 <- ifelse(  LABS_REDCapRANK$ntbnp !="NULL",1,"")
+LABS_REDCapRANK$lab_type___6 <- ifelse(  LABS_REDCapRANK$tsh !="NULL"| LABS_REDCapRANK$freet4 !="NULL"| LABS_REDCapRANK$t3 !="NULL", 1, "")
+LABS_REDCapRANK$lab_type___7 <- ifelse(LABS_REDCapRANK$ldh !="NULL", 1, "")
+LABS_REDCapRANK$lab_type___9 <- ifelse(  LABS_REDCapRANK$pt !="NULL"| LABS_REDCapRANK$pt_inr !="NULL"| LABS_REDCapRANK$ptt !="NULL", 1, "")
+LABS_REDCapRANK$lab_type___10 <- ifelse( LABS_REDCapRANK$crp !="NULL"| LABS_REDCapRANK$esr !="NULL"| LABS_REDCapRANK$ferritin !="NULL", 1, "")
+
+
+
+
+#Let's select columns that are required for proper importing into redcap for our final import
+EHR_autoLabs_REDCAP <-  LABS_REDCapRANK %>% dplyr::select(record_id,redcap_repeat_instrument,redcap_repeat_instance,lab_dtc,datetime,lab_type___1,lab_type___2,lab_type___3, lab_type___4,lab_type___5,lab_type___6,lab_type___7,lab_type___9,lab_type___10,na,	k,	cl,	co2,	bun,	cre, gfr,	glu,	anion,	alb,	tbili,	ca,	ldh,	tp,	sgpt,	sgot,	alkp,	glob,	wbc,	rbc,	hgb,	hct,	mcv,	mch,	mchc,	plt,	mpv,	rdw,	neut,	lymp,	mon, eosp,	basop,	immgranp,	nrbc,	ntbnp,	tsh,	freet4,	t3,	pt,	pt_inr,	ptt,	crp,	esr,	ferritin)
+
+EHR_autoLabs_REDCAP$lab_time<- EHR_autoLabs_REDCAP$datetime
+
+#Let's select columns that are required for proper importing into redcap for our final import
+EHR_autoLabs_REDCAP <-  EHR_autoLabs_REDCAP%>%dplyr::select(record_id,redcap_repeat_instrument,redcap_repeat_instance,lab_dtc,lab_time,lab_type___1,lab_type___2,lab_type___3, lab_type___4,lab_type___5,lab_type___6,lab_type___7,lab_type___9,lab_type___10,na,	k,	cl,	co2,	bun,	cre,	gfr,	glu,	anion,	alb,	tbili,	ca,	ldh,	tp,	sgpt,	sgot,	alkp,	glob,	wbc,	rbc,	hgb,	hct,	mcv,	mch,	mchc,	plt,	mpv,	rdw,	neut,	lymp,	mon, eosp,	basop,	immgranp,	nrbc,		ntbnp,	tsh,	freet4,	t3,	pt,	pt_inr,	ptt,	crp,	esr,	ferritin)
+```
+### Clean Final Data
+```{r Remove double instances oflabs, message=FALSE, warning=FALSE}
+
+#Let's remove the duplicated labs and only keep the first instance, we need to account for the fact that some labs have decimal points in our regex. 
+#One can choose to create a separate instance for every single lab, or take the average or median as desired.
+#For demonstration purposes here, we will retain first instance.
+#These occurences are if the patient for example had potassium and potassium poc on same day/panel.
+
+EHR_autoLabs_REDCAP$na <-stri_extract_first_regex(EHR_autoLabs_REDCAP$na,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$k <-stri_extract_first_regex(EHR_autoLabs_REDCAP$k,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$cl <-stri_extract_first_regex(EHR_autoLabs_REDCAP$cl,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$co2 <-stri_extract_first_regex(EHR_autoLabs_REDCAP$co2,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$bun <-stri_extract_first_regex(EHR_autoLabs_REDCAP$bun,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$cre <-stri_extract_first_regex(EHR_autoLabs_REDCAP$cre,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$gfr <-stri_extract_first_regex(EHR_autoLabs_REDCAP$gfr,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$glu <-stri_extract_first_regex(EHR_autoLabs_REDCAP$glu,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$anion <-stri_extract_first_regex(EHR_autoLabs_REDCAP$anion,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$alb <-stri_extract_first_regex(EHR_autoLabs_REDCAP$alb,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$tbili <-stri_extract_first_regex(EHR_autoLabs_REDCAP$tbili,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$ca <-stri_extract_first_regex(EHR_autoLabs_REDCAP$ca,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$ldh <-stri_extract_first_regex(EHR_autoLabs_REDCAP$ldh,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$tp <-stri_extract_first_regex(EHR_autoLabs_REDCAP$tp,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$sgpt <-stri_extract_first_regex(EHR_autoLabs_REDCAP$sgpt,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$sgot <-stri_extract_first_regex(EHR_autoLabs_REDCAP$sgot,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$alkp <-stri_extract_first_regex(EHR_autoLabs_REDCAP$alkp,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$glob <-stri_extract_first_regex(EHR_autoLabs_REDCAP$glob,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$wbc <-stri_extract_first_regex(EHR_autoLabs_REDCAP$wbc,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$rbc <-stri_extract_first_regex(EHR_autoLabs_REDCAP$rbc,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$hgb <-stri_extract_first_regex(EHR_autoLabs_REDCAP$hgb,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$hct <-stri_extract_first_regex(EHR_autoLabs_REDCAP$hct,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$mcv <-stri_extract_first_regex(EHR_autoLabs_REDCAP$mcv,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$mch <-stri_extract_first_regex(EHR_autoLabs_REDCAP$mch,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$mchc <-stri_extract_first_regex(EHR_autoLabs_REDCAP$mchc,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$plt <-stri_extract_first_regex(EHR_autoLabs_REDCAP$plt,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$mpv <-stri_extract_first_regex(EHR_autoLabs_REDCAP$mpv,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$rdw <-stri_extract_first_regex(EHR_autoLabs_REDCAP$rdw,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$neut <-stri_extract_first_regex(EHR_autoLabs_REDCAP$neut,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$lymp <-stri_extract_first_regex(EHR_autoLabs_REDCAP$lymp,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$mon <-stri_extract_first_regex(EHR_autoLabs_REDCAP$mon,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$eosp <-stri_extract_first_regex(EHR_autoLabs_REDCAP$eosp,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$basop <-stri_extract_first_regex(EHR_autoLabs_REDCAP$basop,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$immgranp <-stri_extract_first_regex(EHR_autoLabs_REDCAP$immgranp,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$nrbc <-stri_extract_first_regex(EHR_autoLabs_REDCAP$nrbc,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$ntbnp <-stri_extract_first_regex(EHR_autoLabs_REDCAP$ntbnp,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$tsh <-stri_extract_first_regex(EHR_autoLabs_REDCAP$tsh,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$freet4 <-stri_extract_first_regex(EHR_autoLabs_REDCAP$freet4,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$t3 <-stri_extract_first_regex(EHR_autoLabs_REDCAP$t3,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$pt <-stri_extract_first_regex(EHR_autoLabs_REDCAP$pt,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$pt_inr <-stri_extract_first_regex(EHR_autoLabs_REDCAP$pt_inr,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$ptt <-stri_extract_first_regex(EHR_autoLabs_REDCAP$ptt,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$crp <-stri_extract_first_regex(EHR_autoLabs_REDCAP$crp,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$esr <-stri_extract_first_regex(EHR_autoLabs_REDCAP$esr,"[0-9]*\\.?[0-9]*")
+
+EHR_autoLabs_REDCAP$ferritin <-stri_extract_first_regex(EHR_autoLabs_REDCAP$ferritin,"[0-9]*\\.?[0-9]*")
+
+
+#Let's remove any labs with an 'NA' for the lab_dtc because these cannot have an instance.
+
+EHR_autoLabs_REDCAP<- EHR_autoLabs_REDCAP%>% drop_na(lab_dtc)
+
+#If a lab_dtc is present but no time is there, let's default to noon/0:0:0 so that an instance can be created.
+
+
+EHR_autoLabs_REDCAP$lab_time<- as.POSIXct(EHR_autoLabs_REDCAP$lab_time,  format="%Y-%m-%d %H:%M:%S")
+EHR_autoLabs_REDCAP$lab_time[is.na(EHR_autoLabs_REDCAP$lab_time)] <- (EHR_autoLabs_REDCAP$lab_dtc[is.na(EHR_autoLabs_REDCAP$lab_time)])
+
+#Now that new lab_times have been introduced, we need to create new instances
+EHR_autoLabs_REDCAP <- EHR_autoLabs_REDCAP %>%  dplyr::arrange(record_id, lab_dtc,lab_time)%>%
+   dplyr::group_by(record_id) %>% dplyr::mutate(redcap_repeat_instance = dense_rank(lab_time))
+
+
+write.csv(EHR_autoLabs_REDCAP, "importREDCap.csv")
+EHR_autoLabs_REDCAP #######################
+```
+
+### Manual/API Import
+```{r Import into REDCap based Registry, message=FALSE, warning=FALSE}
+#Manually import the csv file or import data with REDCapR along with the institution/project-specific distributed API.
+```
+### Interoperability Conversion
+```{r Convert all labs for interoperability into LOINC code in case data is merged with other databases/registries,message=FALSE, warning=FALSE}
+
+#Let's remap the labs data into LOINC codes by using the look up table and a REDCap export. A real REDCap export of the import of the data creatde in this session with simulated data and keys is provided here.
+#Let's import the data from REDCap Lab results and the loinc lookup table for labs
+# Load Data
+data_labs <- read_excel("Exported_From_REDCap_import.xlsx")
+
+loinc <- read_excel("loinc_labs_lookup.xlsx")
+
+#Let's match and replace old column names with new column loinc codes
+
+names(data_labs) <- mapvalues(names(data_labs),
+                             from = loinc$labtype_REDCAP,
+                             to = as.character(loinc$LOINC))
+
+```
+
